@@ -7,7 +7,7 @@ const ws   = require('ws');
 
 const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET } = require('./config');
 const REDIRECT_URI          = 'http://127.0.0.1:8888/callback';
-const SCOPES                = 'user-read-playback-state user-read-currently-playing user-modify-playback-state';
+const SCOPES = 'user-read-playback-state user-read-currently-playing user-modify-playback-state streaming';
 
 // ─── Persistence ───────────────────────────────────────────────────────────────
 const DATA_DIR      = path.join(app.getPath('userData'), 'h4nnis-overlay');
@@ -49,6 +49,7 @@ let clickThrough   = false;
 let dealer         = null;      // WebSocket connection to Spotify dealer
 let dealerPingTimer = null;
 let dealerReconnectTimer = null;
+let dealerFetchTimeout = null;
 let lastTrackId    = null;
 let cachedLyrics   = [];
 let fallbackPollInterval = null; // safety net poll if WS drops
@@ -117,7 +118,7 @@ async function spotifyFetch(endpoint, method = 'GET', bodyData = null) {
     if (!response.ok) return null;
     const text = await response.text();
     return text.trim() ? JSON.parse(text) : null;
-  } catch (err) { console.error('spotifyFetch:', err.message); return null; }
+  } catch (err) { console.error(`spotifyFetch [${endpoint}]:`, err.message); return null; }
 }
 
 const playbackPlay     = ()    => spotifyFetch('/me/player/play',     'PUT');
@@ -254,7 +255,12 @@ async function connectDealer() {
   console.log('Connecting to Spotify dealer WebSocket…');
 
   try {
-    dealer = new ws.WebSocket(`wss://dealer.spotify.com/?access_token=${token}`);
+    dealer = new ws.WebSocket(`wss://dealer.spotify.com/?access_token=${token}`, {
+      headers: {
+        'Origin': 'https://open.spotify.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      }
+    });
   } catch (e) {
     console.error('Dealer WS create error:', e.message);
     scheduleReconnect();
@@ -262,33 +268,36 @@ async function connectDealer() {
   }
 
   dealer.on('open', () => {
-    console.log('Dealer WebSocket connected');
+    console.log('Dealer WebSocket connected — waiting for connection ID…');
     // Ping every 30s to keep alive
     dealerPingTimer = setInterval(() => {
       if (dealer && dealer.readyState === ws.WebSocket.OPEN) {
         dealer.send(JSON.stringify({ type: 'ping' }));
       }
     }, 30000);
-    // Fetch initial state immediately
-    fetchAndSendCurrentState();
   });
 
   dealer.on('message', async (raw) => {
+    const str = raw.toString();
+    let msg;
+    try { msg = JSON.parse(str); } catch { console.log('Dealer non-JSON frame, ignoring'); return; }
     try {
-      const msg = JSON.parse(raw.toString());
-
-      // Dealer sends a connection_id on first message — acknowledge it
-      if (msg.type === 'message' && msg.headers?.['Spotify-Connection-Id']) {
+      // First message contains the connection_id — use it to subscribe
+      if (msg.headers?.['Spotify-Connection-Id']) {
         const connId = msg.headers['Spotify-Connection-Id'];
-        await registerDealerSubscriptions(connId, token);
+        await registerDealerSubscriptions(connId);
+        // Now safe to fetch initial state
+        fetchAndSendCurrentState();
         return;
       }
 
-      // Playback state event
-      if (msg.type === 'message' && msg.payloads) {
-        for (const payload of msg.payloads) {
-          await handleDealerPayload(payload);
-        }
+
+      // Any message with payloads means playback state may have changed
+      // Since payloads are protobuf (not JSON), we just trigger a REST fetch
+      if (msg.payloads && msg.payloads.length > 0) {
+        // Debounce — avoid hammering REST if multiple messages arrive at once
+        if (dealerFetchTimeout) clearTimeout(dealerFetchTimeout);
+        dealerFetchTimeout = setTimeout(async () => { await fetchAndSendCurrentState(); setTimeout(fetchAndSendCurrentState, 1500); }, 700);
       }
     } catch (e) { /* ignore parse errors */ }
   });
@@ -306,49 +315,59 @@ async function connectDealer() {
   });
 }
 
-async function registerDealerSubscriptions(connId, token) {
+async function registerDealerSubscriptions(connId) {
   const fetch = require('node-fetch');
+  const token = await getValidToken();
+  if (!token) { console.error('No valid token for dealer subscription'); return; }
   try {
-    await fetch(
+    const r = await fetch(
       `https://api.spotify.com/v1/me/notifications/player?connection_id=${encodeURIComponent(connId)}`,
-      { method: 'PUT', headers: { Authorization: `Bearer ${token}` } }
+      { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
     );
-    console.log('Dealer subscriptions registered');
+    console.log('Dealer subscription status:', r.status, r.statusText);
+    if (r.ok || r.status === 204) console.log('Dealer subscriptions registered ✓');
+    else console.error('Dealer subscription failed:', r.status);
   } catch (e) {
     console.error('Dealer sub error:', e.message);
   }
 }
 
 async function handleDealerPayload(payload) {
-  // Payloads can be base64-encoded or plain JSON strings
   let data;
-  try {
-    const decoded = Buffer.from(payload, 'base64').toString('utf8');
-    data = JSON.parse(decoded);
-  } catch {
-    try { data = typeof payload === 'string' ? JSON.parse(payload) : payload; } catch { return; }
-  }
 
-  const state = data?.cluster?.player_state || data?.player_state;
-  if (!state) return;
+  // Payloads arrive as strings — try plain JSON first, then base64
+  if (typeof payload === 'string') {
+    try { data = JSON.parse(payload); } catch {
+      try { data = JSON.parse(Buffer.from(payload, 'base64').toString('utf8')); } catch { return; }
+    }
+  } else if (Buffer.isBuffer(payload)) {
+    try { data = JSON.parse(payload.toString('utf8')); } catch { return; }
+  } else if (typeof payload === 'object') {
+    data = payload;
+  } else { return; }
 
-  const trackMeta  = state.track?.metadata;
-  const trackUri   = state.track?.uri;
+  // Navigate possible nesting
+  const cluster     = data?.cluster || data;
+  const playerState = cluster?.player_state || data?.player_state;
+  if (!playerState) return;
+
+  const trackUri  = playerState?.track?.uri;
   if (!trackUri) return;
 
-  const trackId    = trackUri.split(':').pop();
-  const isPlaying  = !state.is_paused;
-  const progressMs = parseInt(state.position_as_of_timestamp || '0');
-  const duration   = parseInt(trackMeta?.['duration'] || trackMeta?.['album_disc_number'] || '0');
+  const trackId   = trackUri.split(':').pop();
+  const isPlaying = !playerState.is_paused;
+  const progressMs = parseInt(playerState.position_as_of_timestamp || playerState.position || '0');
 
-  const deviceName = data?.cluster?.active_device_id
-    ? (data?.cluster?.devices?.[data.cluster.active_device_id]?.name || null)
+  // Device name from cluster
+  const activeDeviceId = cluster?.active_device_id;
+  const deviceName = activeDeviceId && cluster?.devices
+    ? (cluster.devices[activeDeviceId]?.name || null)
     : null;
 
   sendPlaybackUpdate(progressMs, isPlaying, deviceName);
 
   if (trackId !== lastTrackId) {
-    // Build a minimal track object and fetch full details
+    // Fetch full state from REST to get track metadata, shuffle, repeat, volume
     const fullState = await getPlaybackState();
     if (fullState?.item) {
       await handleTrackChange(
@@ -625,6 +644,7 @@ app.on('will-quit', () => {
   if (dealer)               { try { dealer.close(); } catch {} }
   if (dealerPingTimer)      clearInterval(dealerPingTimer);
   if (dealerReconnectTimer) clearTimeout(dealerReconnectTimer);
+  if (dealerFetchTimeout)   clearTimeout(dealerFetchTimeout);
   if (fallbackPollInterval) clearInterval(fallbackPollInterval);
 });
 
