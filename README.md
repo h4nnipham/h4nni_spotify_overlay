@@ -41,7 +41,7 @@ Grab the latest installer from [Releases](../../releases/latest). Run the `.exe`
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+git clone https://github.com/h4nnipham/h4nni_spotify_overlay.git
 cd YOUR_REPO_NAME
 ```
 
@@ -126,7 +126,6 @@ Lyrics are fetched in this order:
 
 ## Known limitations
 
-- **Valorant** — Riot's Vanguard anti-cheat blocks all external overlays at the kernel level. This is not fixable from Electron.
 - **Exclusive fullscreen games** — works best when games run in borderless windowed mode.
 
 ---
