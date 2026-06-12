@@ -23,14 +23,6 @@ A floating real-time lyrics overlay for Spotify on Windows. Displays synced lyri
 - Window position and size remembered between sessions
 - Active device display and no-device indicator
 
----
-
-## Download
-
-Grab the latest installer from [Releases](../../releases/latest). Run the `.exe` and you're good to go — no setup needed, just connect your Spotify account on first launch.
-
----
-
 ## Building from source
 
 ### Prerequisites
