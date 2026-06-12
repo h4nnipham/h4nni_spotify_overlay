@@ -42,7 +42,7 @@ Grab the latest installer from [Releases](../../releases/latest). Run the `.exe`
 
 ```bash
 git clone https://github.com/h4nnipham/h4nni_spotify_overlay.git
-cd YOUR_REPO_NAME
+cd h4nni_spotify_overlay
 ```
 
 ### 2. Set up Spotify credentials
