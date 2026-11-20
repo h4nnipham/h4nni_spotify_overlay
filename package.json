@@ -1,0 +1,30 @@
+{
+  "name": "h4nnis-lyrics-overlay-for-spotify",
+  "version": "1.5.0",
+  "description": "Floating lyrics overlay for Spotify on Windows, by h4nni",
+  "build": {
+    "appId": "com.h4nni.lyrics",
+    "productName": "h4nni's Lyrics Overlay (Spotify)",
+    "icon": "assets/icon.ico"
+  },
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder"
+  },
+  "dependencies": {
+    "any-ascii": "0.3.3",
+    "kuroshiro": "1.2.0",
+    "kuroshiro-analyzer-kuromoji": "1.1.0",
+    "node-fetch": "^2.7.0",
+    "pinyin-pro": "3.26.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^26.8.1"
+  },
+  "author": "h4nnipham",
+  "license": "MIT"
+}
