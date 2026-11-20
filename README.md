@@ -174,6 +174,7 @@ If a song has no lyrics, or the wrong ones, you can add or fix them at [lrclib.n
 | "Romanization needs its libraries" message | Run `npm install` in the app folder, then restart |
 | "Romanization needs the updated preload.js" | Make sure all files in `src/` are from the same version |
 | "No active Spotify device" | Start playing on any device. The overlay follows whatever is active on your account |
+| "Spotify is limiting requests from this app" | Spotify caps how often each app can check what's playing, and going over can pause the app for hours. The overlay waits out the ban (even across restarts), so leave it and it resumes on its own. Running only one copy at a time helps avoid it |
 | Lyrics feel early or late | Adjust **Lyrics timing** in Settings → Current line & motion |
 | Wrong lyrics or none | The song may be missing or mismatched on LRCLIB. You can add it there |
 | Overlay hidden behind a game | Run the game in borderless windowed mode |
