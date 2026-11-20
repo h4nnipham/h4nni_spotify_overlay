@@ -347,6 +347,7 @@ input[type=range].bar-range::-webkit-slider-thumb { -webkit-appearance:none; wid
 
   <!-- No device banner -->
   <div class="no-device-banner" id="noDeviceBanner">No active Spotify device</div>
+  <div class="no-device-banner" id="rateLimitBanner" title="Spotify limits how often each app can ask what's playing. The overlay pauses all requests until the limit lifts."></div>
 
   <!-- Login -->
   <div class="login-screen" id="loginScreen">
@@ -890,6 +891,28 @@ window.spotify.onNoDevice(() => {
   document.getElementById('noDeviceBanner').classList.add('visible');
   document.getElementById('deviceName').textContent = '';
   setLocalClock(currentProgress(), false);
+});
+
+// --- Spotify rate limit -------------------------------------------------------
+let rateLimitUntil = 0;
+let rateLimitTimer = null;
+function formatWait(ms) {
+  const m = Math.ceil(ms / 60000);
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+function renderRateLimit() {
+  const el = document.getElementById('rateLimitBanner');
+  const left = rateLimitUntil - Date.now();
+  if (left <= 0) { el.classList.remove('visible'); clearInterval(rateLimitTimer); rateLimitTimer = null; return; }
+  el.textContent = `Spotify is limiting requests from this app. Resuming in ${formatWait(left)}`;
+  el.classList.add('visible');
+}
+window.spotify.onRateLimited(({ until }) => {
+  rateLimitUntil = until || 0;
+  clearInterval(rateLimitTimer);
+  rateLimitTimer = rateLimitUntil ? setInterval(renderRateLimit, 30000) : null;
+  renderRateLimit();
 });
 
 function updateDeviceName(name) {
