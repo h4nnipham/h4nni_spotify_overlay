@@ -10,7 +10,7 @@ const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET } = require('./config');
 const REDIRECT_URI          = 'http://127.0.0.1:8888/callback';
 const SCOPES = 'user-read-playback-state user-read-currently-playing user-modify-playback-state streaming';
 
-// ─── Persistence ───────────────────────────────────────────────────────────────
+// --- Persistence ---------------------------------------------------------------
 const DATA_DIR      = path.join(app.getPath('userData'), 'h4nnis-overlay');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const STATE_FILE    = path.join(DATA_DIR, 'windowstate.json');
@@ -39,7 +39,7 @@ const defaultSettings = {
 let settings    = loadJSON(SETTINGS_FILE, defaultSettings);
 let windowState = loadJSON(STATE_FILE, { x: null, y: null, width: 320, height: 520 });
 
-// ─── App state ─────────────────────────────────────────────────────────────────
+// --- App state -----------------------------------------------------------------
 let overlayWindow  = null;
 let authWindow     = null;
 let authServer     = null;
@@ -47,14 +47,14 @@ let accessToken    = null;
 let refreshToken   = null;
 let tokenExpiresAt = 0;
 let clickThrough   = false;
-let dealer         = null;      // WebSocket connection to Spotify dealer
+let dealer         = null;
 let dealerPingTimer = null;
 let dealerReconnectTimer = null;
 let dealerFetchTimeout = null;
 let lastTrackId    = null;
 let cachedLyrics   = [];
 
-// ─── Auth ───────────────────────────────────────────────────────────────────────
+// --- Auth -----------------------------------------------------------------------
 function getAuthUrl() {
   const params = new URLSearchParams({
     client_id: SPOTIFY_CLIENT_ID, response_type: 'code',
@@ -74,7 +74,7 @@ async function exchangeCode(code) {
   return r.json();
 }
 
-// Only one refresh at a time — concurrent callers share the same promise
+// Only one refresh at a time, concurrent callers share the same promise
 let refreshPromise = null;
 function refreshAccessToken() {
   if (!refreshPromise) {
@@ -112,7 +112,7 @@ async function getValidToken() {
   return accessToken;
 }
 
-// ─── HTTP helpers ──────────────────────────────────────────────────────────────
+// --- HTTP helpers --------------------------------------------------------------
 const fetch = require('node-fetch');
 
 async function fetchWithTimeout(resource, opts = {}, timeoutMs = 8000) {
@@ -127,7 +127,7 @@ async function fetchWithTimeout(resource, opts = {}, timeoutMs = 8000) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ─── Spotify REST API ──────────────────────────────────────────────────────────
+// --- Spotify REST API ----------------------------------------------------------
 let rateLimitedUntil = 0;
 
 // Returns { ok, status, data }. status 0 = network error / not authed.
@@ -174,7 +174,7 @@ const setRepeat        = (s)   => spotifyFetch(`/me/player/repeat?state=${s}`,  
 const getPlaybackState = ()    => spotifyFetch('/me/player');
 const getQueue         = ()    => spotifyFetch('/me/player/queue');
 
-// ─── Lyrics ────────────────────────────────────────────────────────────────────
+// --- Lyrics --------------------------------------------------------------------
 const LYRICS_UA          = 'h4nnis-lyrics-overlay (https://github.com/h4nnipham/h4nni_spotify_overlay)';
 const LYRICS_CACHE_FILE  = path.join(DATA_DIR, 'lyrics-cache.json');
 const LYRICS_CACHE_MAX   = 500;
@@ -432,7 +432,7 @@ function parseLRC(lrc) {
   return out;
 }
 
-// ─── Track / playback state ────────────────────────────────────────────────────
+// --- Track / playback state ----------------------------------------------------
 let trackChangeSeq = 0;
 let lastKnown = null; // { id, duration, progress, at, playing }
 
@@ -503,7 +503,7 @@ function sendPlaybackUpdate(progressMs, isPlaying, deviceName) {
   });
 }
 
-// ─── Spotify Dealer WebSocket ──────────────────────────────────────────────────
+// --- Spotify Dealer WebSocket --------------------------------------------------
 let dealerSubscribed = false;
 let dealerBackoff    = 5000;
 
@@ -603,10 +603,7 @@ function scheduleReconnect(delay = 5000) {
   }, delay);
 }
 
-// ─── Adaptive polling ──────────────────────────────────────────────────────────
-// Polls quickly while playing (dealer WS usually isn't available to normal app
-// tokens) and wakes up right when the current song should end so track changes
-// show up without delay.
+// --- Adaptive polling ----------------------------------------------------------
 let pollTimer    = null;
 let pollInFlight = null;
 
@@ -644,7 +641,7 @@ async function doFetchState() {
       overlayWindow.webContents.send('no-device');
       return;
     }
-    // Compensate for half the request round-trip so lyrics aren't late
+    // Compensates for half the request round-trip so lyrics aren't late
     const progress = data.is_playing ? Math.min(data.progress_ms + Math.round(rtt / 2), data.item.duration_ms) : data.progress_ms;
     lastKnown = { id: data.item.id, duration: data.item.duration_ms, progress, at: Date.now(), playing: data.is_playing };
 
@@ -668,7 +665,7 @@ function startFallbackPoll() {
   schedulePoll(0);
 }
 
-// ─── Click-through & shortcuts ─────────────────────────────────────────────────
+// --- Click-through & shortcuts -------------------------------------------------
 function toggleClickThrough() {
   clickThrough = !clickThrough;
   if (overlayWindow) {
@@ -693,7 +690,7 @@ function registerShortcuts() {
   register(settings.prevKey,         async () => { await playbackPrevious(); schedulePoll(700); }, 'prev');
 }
 
-// ─── Window ────────────────────────────────────────────────────────────────────
+// --- Window --------------------------------------------------------------------
 function getWindowBounds(mode) {
   const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize;
   if (mode === 'fullscreen') return { width: sw, height: sh, x: 0, y: 0, resizable: false };
@@ -754,7 +751,7 @@ function applyWindowMode(mode) {
   }
 }
 
-// ─── OAuth server ──────────────────────────────────────────────────────────────
+// --- OAuth server --------------------------------------------------------------
 function startAuthServer() {
   if (authServer && authServer.listening) return Promise.resolve(true);
   return new Promise((resolve, reject) => {
@@ -801,7 +798,7 @@ function startAuthServer() {
   });
 }
 
-// ─── IPC ───────────────────────────────────────────────────────────────────────
+// --- IPC -----------------------------------------------------------------------
 ipcMain.on('login', async () => {
   try {
     await startAuthServer();
@@ -918,7 +915,7 @@ ipcMain.on('reset-settings', () => {
   if (overlayWindow) { overlayWindow.setAlwaysOnTop(true, 'screen-saver'); overlayWindow.webContents.send('settings-imported', settings); }
 });
 
-// ─── App lifecycle ─────────────────────────────────────────────────────────────
+// --- App lifecycle -------------------------------------------------------------
 app.whenReady().then(() => {
   createOverlayWindow();
   registerShortcuts();
