@@ -44,5 +44,6 @@ contextBridge.exposeInMainWorld('spotify', {
   onClickThroughChanged: (cb) => ipcRenderer.on('click-through-changed',(_, d) => cb(d)),
   onModeChanged:         (cb) => ipcRenderer.on('mode-changed',         (_, d) => cb(d)),
   onSettingsImported:    (cb) => ipcRenderer.on('settings-imported',    (_, d) => cb(d)),
+  onRateLimited:         (cb) => ipcRenderer.on('rate-limited',         (_, d) => cb(d)),
   onNoDevice:            (cb) => ipcRenderer.on('no-device',            ()     => cb()),
 });
