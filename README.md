@@ -191,4 +191,3 @@ If a song has no lyrics, or the wrong ones, you can add or fix them at [lrclib.n
 ## License
 
 MIT. Do whatever you want with it.
-"# h4nni_spotify_overlay" 
