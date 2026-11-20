@@ -1,4 +1,4 @@
-// ─── Lyrics transliteration (romanization) ─────────────────────────────────────
+// --- Lyrics transliteration (romanization) -------------------------------------
 // Japanese → Hepburn romaji (kuroshiro + kuromoji, loaded lazily — the
 //            dictionary is large, so it's only loaded for Japanese songs)
 // Korean   → Revised Romanization (built-in, with the common sound-change rules)
@@ -12,7 +12,7 @@ const HAN       = /[㐀-䶿一-鿿豈-﫿]/;
 
 const needsTransliteration = (text) => NON_LATIN.test(text || '');
 
-// ── any-ascii for remaining non-Latin runs (keeps accented Latin as-is) ────────
+// -- any-ascii for remaining non-Latin runs (keeps accented Latin as-is) --------
 let anyAsciiFn = null;
 function anyAscii(s) {
   if (!anyAsciiFn) { const m = require('any-ascii'); anyAsciiFn = m.default || m; }
@@ -23,12 +23,11 @@ function asciiRest(s) {
   return s.replace(NON_LATIN_RUN, (run) => anyAscii(run));
 }
 
-// ── Korean (Revised Romanization) ──────────────────────────────────────────────
+// -- Korean (Revised Romanization) ----------------------------------------------
 const KO_INITIAL = ['g','kk','n','d','tt','r','m','b','pp','s','ss','','j','jj','ch','k','t','p','h'];
 const KO_VOWEL   = ['a','ae','ya','yae','eo','e','yeo','ye','o','wa','wae','oe','yo','u','wo','we','wi','yu','eu','ui','i'];
 const KO_FINAL   = ['','k','k','k','n','n','n','t','l','k','m','l','l','l','p','l','m','p','p','t','t','ng','t','t','k','t','p','t'];
-// When a final consonant is followed by ㅇ it moves to the next syllable:
-// [what stays, what moves]
+// --
 const KO_LIAISON = {
   1:['','g'], 2:['','kk'], 3:['k','s'], 4:['','n'], 5:['n','j'], 6:['','n'], 7:['','d'], 8:['','r'],
   9:['l','g'], 10:['l','m'], 11:['l','b'], 12:['l','s'], 13:['l','t'], 14:['l','p'], 15:['','r'],
@@ -50,7 +49,7 @@ function romanizeKorean(text) {
     const prev = syl[n - 1];
     const next = syl[n + 1];
 
-    // Onset (may have been modified by the previous syllable's final)
+// --
     let onset = s.onset !== undefined ? s.onset : KO_INITIAL[s.i];
     if (n === 0 || !prev) {
       if (s.i === 5) onset = 'r'; // word-initial ㄹ is still written r in RR
@@ -87,17 +86,14 @@ function romanizeKorean(text) {
   return out;
 }
 
-// ── Chinese ─────────────────────────────────────────────────────────────────────
+// -- Chinese ---------------------------------------------------------------------
 let pinyinFn = null;
 function romanizeChinese(text) {
   if (!pinyinFn) pinyinFn = require('pinyin-pro').pinyin;
   return pinyinFn(text, { toneType: 'symbol', nonZh: 'consecutive' });
 }
 
-// ── Japanese ────────────────────────────────────────────────────────────────────
-// Tokenise with kuromoji, then romanise word-by-word ourselves: kuroshiro's own
-// "spaced" mode romanises each token separately, which breaks small っ across
-// tokens (だった → "datsu ta") and leaves particles like は as "ha".
+// -- Japanese --------------------------------------------------------------------
 let jpPromise = null;
 function getJapanese() {
   if (!jpPromise) {
@@ -121,7 +117,7 @@ function getJapanese() {
   return jpPromise;
 }
 
-// Common lyric words the IPADIC dictionary splits or reads unnaturally
+// --
 const JA_OVERRIDES = [
   ['二人', 'ふたり'], ['一人', 'ひとり'], ['明日', 'あした'], ['貴方', 'あなた'], ['貴女', 'あなた'],
   ['大人', 'おとな'], ['今日', 'きょう'], ['昨日', 'きのう'], ['一日', 'いちにち'], ['何処', 'どこ'],
@@ -172,7 +168,7 @@ async function romanizeJapanese(text) {
     .join(' ');
 }
 
-// ── Public API ──────────────────────────────────────────────────────────────────
+// -- Public API ------------------------------------------------------------------
 function detectLanguage(allText) {
   if (KANA.test(allText))   return 'ja';
   if (HANGUL.test(allText)) return 'ko';
@@ -194,7 +190,7 @@ async function romanize(text, lang) {
   return tidy(asciiRest(r));
 }
 
-// lines: [{ text, words?: [string] }] → [{ text, words? } | null] (null = unchanged)
+// --
 async function transliterateLines(lines) {
   const all  = lines.map((l) => l.text || '').join('\n');
   if (!needsTransliteration(all)) return { lang: null, lines: lines.map(() => null) };
@@ -202,8 +198,7 @@ async function transliterateLines(lines) {
   const out  = [];
   let error  = null;
   if (lang === 'ja') {
-    // Load the Japanese analyzer up front so a setup problem is reported once,
-    // clearly, instead of silently leaving every line unchanged
+// --
     try { await getJapanese(); }
     catch (e) {
       console.error('Japanese romanization unavailable:', e);
@@ -217,7 +212,7 @@ async function transliterateLines(lines) {
     if (!l.text || !needsTransliteration(l.text)) { out.push(null); continue; }
     try {
       if (Array.isArray(l.words) && l.words.length) {
-        // Keep a 1:1 word mapping so exact word timings still line up
+// --
         const words = [];
         for (const w of l.words) words.push((await romanize(w, lang)).replace(/\s+/g, '') || w);
         out.push({ text: words.join(' '), words });
