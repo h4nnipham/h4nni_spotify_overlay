@@ -3,7 +3,6 @@ const path = require('path');
 const http = require('http');
 const url  = require('url');
 const fs   = require('fs');
-const ws   = require('ws');
 const { transliterateLines } = require('./transliterate');
 
 const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET } = require('./config');
@@ -47,10 +46,6 @@ let accessToken    = null;
 let refreshToken   = null;
 let tokenExpiresAt = 0;
 let clickThrough   = false;
-let dealer         = null;
-let dealerPingTimer = null;
-let dealerReconnectTimer = null;
-let dealerFetchTimeout = null;
 let lastTrackId    = null;
 let cachedLyrics   = [];
 
@@ -74,7 +69,7 @@ async function exchangeCode(code) {
   return r.json();
 }
 
-// Only one refresh at a time, concurrent callers share the same promise
+// Only one refresh at a time — concurrent callers share the same promise
 let refreshPromise = null;
 function refreshAccessToken() {
   if (!refreshPromise) {
@@ -98,8 +93,6 @@ async function doRefreshAccessToken() {
       accessToken    = data.access_token;
       tokenExpiresAt = Date.now() + data.expires_in * 1000;
       if (data.refresh_token) refreshToken = data.refresh_token;
-      // Reconnect dealer with fresh token (the token is part of the WS URL)
-      connectDealer();
       return true;
     }
   } catch (e) { console.error('Token refresh failed:', e.message); }
@@ -128,11 +121,31 @@ async function fetchWithTimeout(resource, opts = {}, timeoutMs = 8000) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- Spotify REST API ----------------------------------------------------------
-let rateLimitedUntil = 0;
+const RATE_FILE          = path.join(DATA_DIR, 'ratelimit.json');
+const BG_BUDGET          = 8;      // background requests per 30s
+const BG_WINDOW_MS       = 30000;
+let rateLimitedUntil     = loadJSON(RATE_FILE, { until: 0 }).until || 0;
+const bgRequestTimes     = [];
 
-// Returns { ok, status, data }. status 0 = network error / not authed.
-async function spotifyRequest(endpoint, method = 'GET', bodyData = null, isRetry = false) {
-  if (Date.now() < rateLimitedUntil && method === 'GET') return { ok: false, status: 429, data: null };
+function sendRateLimitStatus() {
+  if (!overlayWindow) return;
+  const until = rateLimitedUntil > Date.now() ? rateLimitedUntil : 0;
+  overlayWindow.webContents.send('rate-limited', { until });
+}
+
+function bgBudgetWaitMs() {
+  const now = Date.now();
+  while (bgRequestTimes.length && now - bgRequestTimes[0] > BG_WINDOW_MS) bgRequestTimes.shift();
+  return bgRequestTimes.length < BG_BUDGET ? 0 : BG_WINDOW_MS - (now - bgRequestTimes[0]) + 50;
+}
+
+// -
+async function spotifyRequest(endpoint, method = 'GET', bodyData = null, isRetry = false, background = false) {
+  if (Date.now() < rateLimitedUntil) return { ok: false, status: 429, data: null };
+  if (background && !isRetry) {
+    if (bgBudgetWaitMs() > 0) return { ok: false, status: 429, data: null, budget: true };
+    bgRequestTimes.push(Date.now());
+  }
   const token = await getValidToken();
   if (!token) return { ok: false, status: 0, data: null };
   try {
@@ -142,12 +155,14 @@ async function spotifyRequest(endpoint, method = 'GET', bodyData = null, isRetry
     if (response.status === 204 || response.status === 202) return { ok: true, status: response.status, data: null };
     if (response.status === 401 && !isRetry) {
       await refreshAccessToken();
-      return spotifyRequest(endpoint, method, bodyData, true);
+      return spotifyRequest(endpoint, method, bodyData, true, background);
     }
     if (response.status === 429) {
-      const wait = parseInt(response.headers.get('retry-after') || '5', 10) * 1000;
+      const wait = Math.max(1, parseInt(response.headers.get('retry-after') || '5', 10)) * 1000;
       rateLimitedUntil = Date.now() + wait;
-      console.warn(`Rate limited ${wait / 1000}s`);
+      saveJSON(RATE_FILE, { until: rateLimitedUntil });
+      console.warn(`Spotify rate limit: pausing all requests for ${formatDuration(wait)} (until ${new Date(rateLimitedUntil).toLocaleTimeString()})`);
+      sendRateLimitStatus();
       return { ok: false, status: 429, data: null };
     }
     if (!response.ok) return { ok: false, status: response.status, data: null };
@@ -172,7 +187,14 @@ const setVolume        = (pct) => spotifyFetch(`/me/player/volume?volume_percent
 const setShuffle       = (s)   => spotifyFetch(`/me/player/shuffle?state=${s}`, 'PUT');
 const setRepeat        = (s)   => spotifyFetch(`/me/player/repeat?state=${s}`,  'PUT');
 const getPlaybackState = ()    => spotifyFetch('/me/player');
-const getQueue         = ()    => spotifyFetch('/me/player/queue');
+const getQueue         = async () => (await spotifyRequest('/me/player/queue', 'GET', null, false, true)).data;
+
+function formatDuration(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 90) return `${s}s`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} min` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
 
 // --- Lyrics --------------------------------------------------------------------
 const LYRICS_UA          = 'h4nnis-lyrics-overlay (https://github.com/h4nnipham/h4nni_spotify_overlay)';
@@ -208,7 +230,7 @@ function getCachedLyrics(trackId) {
   return hit;
 }
 
-// Normalise text for comparisons: lowercase, strip accents & punctuation
+// -
 function normText(s) {
   return (s || '')
     .normalize('NFKD').replace(/[̀-ͯ]/g, '')
@@ -230,7 +252,7 @@ function similarity(a, b) {
   return inter / Math.max(ta.size, tb.size);
 }
 
-// "Song (feat. X) - Remastered 2011" → ["Song (feat. X) - Remastered 2011", "Song"]
+// -
 const VERSION_WORDS = /(remaster|remastered|live|version|edit|mix|mono|stereo|radio|bonus|demo|acoustic|deluxe|explicit|clean|instrumental|single|anniversary|re-?recorded|taylor'?s|from|feat|ft\.|with|sped up|slowed|reverb)/i;
 function titleVariants(name) {
   const out = [name];
@@ -290,8 +312,7 @@ async function fetchLyricsUncached(track) {
   const variants    = titleVariants(title);
   const clean       = variants[variants.length - 1];
 
-  // Track whether any provider actually answered, so a network outage isn't
-  // cached as "no lyrics for this song"
+// -
   let anyReached = false;
   const get = async (u) => { const r = await lyricsGetJSON(u); if (r !== undefined) anyReached = true; return r ?? null; };
 
@@ -367,10 +388,11 @@ function getLyrics(track) {
   return p;
 }
 
-// Warm the cache for the next song in the queue so lyrics show instantly
+// -
 let lastPrefetchFor = null;
 async function prefetchNextLyrics(currentId) {
   if (lastPrefetchFor === currentId) return;
+  if (bgBudgetWaitMs() > 0 || bgRequestTimes.length >= BG_BUDGET - 2) return;
   lastPrefetchFor = currentId;
   try {
     const q = await getQueue();
@@ -415,7 +437,7 @@ function parseLRC(lrc) {
   }
   parsed.sort((a, b) => a.time - b.time);
 
-  // Keep empty lines only as instrumental gaps (≥ 4s), collapse duplicates
+// -
   const out = [];
   for (let i = 0; i < parsed.length; i++) {
     const cur = parsed[i];
@@ -449,7 +471,7 @@ async function handleTrackChange(track, progressMs, isPlaying, shuffleState, rep
   cachedLyrics = [];
   const seq = ++trackChangeSeq;
 
-  // Show the new track immediately — lyrics follow in a separate message
+// -
   const cached = getCachedLyrics(track.id);
   const cachedSynced = cached ? parseLRC(cached.lrc) : null;
   overlayWindow.webContents.send('track-changed', {
@@ -503,122 +525,32 @@ function sendPlaybackUpdate(progressMs, isPlaying, deviceName) {
   });
 }
 
-// --- Spotify Dealer WebSocket --------------------------------------------------
-let dealerSubscribed = false;
-let dealerBackoff    = 5000;
-
-async function connectDealer() {
-  if (dealer) {
-    dealer.removeAllListeners();
-    try { dealer.close(); } catch {}
-    dealer = null;
-  }
-  dealerSubscribed = false;
-  if (dealerPingTimer)     { clearInterval(dealerPingTimer);   dealerPingTimer = null; }
-  if (dealerReconnectTimer){ clearTimeout(dealerReconnectTimer); dealerReconnectTimer = null; }
-
-  const token = await getValidToken();
-  if (!token) return;
-
-  console.log('Connecting to Spotify dealer WebSocket…');
-
-  let sock;
-  try {
-    sock = new ws.WebSocket(`wss://dealer.spotify.com/?access_token=${token}`, {
-      headers: {
-        'Origin': 'https://open.spotify.com',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      }
-    });
-  } catch (e) {
-    console.error('Dealer WS create error:', e.message);
-    scheduleReconnect();
-    return;
-  }
-  dealer = sock;
-
-  sock.on('open', () => {
-    console.log('Dealer WebSocket connected — waiting for connection ID…');
-    dealerPingTimer = setInterval(() => {
-      if (sock.readyState === ws.WebSocket.OPEN) sock.send(JSON.stringify({ type: 'ping' }));
-    }, 30000);
-  });
-
-  sock.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    try {
-      // First message contains the connection_id — use it to subscribe
-      if (msg.headers?.['Spotify-Connection-Id']) {
-        dealerSubscribed = await registerDealerSubscriptions(msg.headers['Spotify-Connection-Id']);
-        if (dealerSubscribed) dealerBackoff = 5000;
-        fetchAndSendCurrentState();
-        return;
-      }
-      // Payloads are protobuf / opaque — treat any as "something changed"
-      if (msg.payloads && msg.payloads.length > 0) {
-        if (dealerFetchTimeout) clearTimeout(dealerFetchTimeout);
-        dealerFetchTimeout = setTimeout(() => { fetchAndSendCurrentState(); schedulePoll(1500); }, 250);
-      }
-    } catch { /* ignore */ }
-  });
-
-  sock.on('close', (code) => {
-    if (dealer !== sock) return; // superseded by a newer connection
-    console.warn(`Dealer WS closed (${code}), retrying in ${dealerBackoff / 1000}s`);
-    if (dealerPingTimer) { clearInterval(dealerPingTimer); dealerPingTimer = null; }
-    dealer = null;
-    dealerSubscribed = false;
-    scheduleReconnect(dealerBackoff);
-    dealerBackoff = Math.min(dealerBackoff * 2, 5 * 60 * 1000);
-  });
-
-  sock.on('error', (err) => {
-    console.error('Dealer WS error:', err.message);
-    // close handler will trigger reconnect
-  });
-}
-
-async function registerDealerSubscriptions(connId) {
-  const token = await getValidToken();
-  if (!token) return false;
-  try {
-    const r = await fetchWithTimeout(
-      `https://api.spotify.com/v1/me/notifications/player?connection_id=${encodeURIComponent(connId)}`,
-      { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-    );
-    if (r.ok) { console.log('Dealer subscriptions registered ✓'); return true; }
-    console.warn('Dealer subscription failed:', r.status, '— using fast polling instead');
-  } catch (e) {
-    console.error('Dealer sub error:', e.message);
-  }
-  return false;
-}
-
-function scheduleReconnect(delay = 5000) {
-  if (dealerReconnectTimer) return;
-  dealerReconnectTimer = setTimeout(async () => {
-    dealerReconnectTimer = null;
-    await connectDealer();
-  }, delay);
-}
-
 // --- Adaptive polling ----------------------------------------------------------
 let pollTimer    = null;
 let pollInFlight = null;
+
+// Lyrics are animated from a local clock between polls, so polls only need to
+// catch pauses, seeks and skips made outside the overlay.
+const POLL_PLAYING_MS   = 5000;
+const POLL_PAUSED_MS    = 10000;
+const POLL_IDLE_MS      = 20000;  // nothing playing / no device
+const POLL_HIDDEN_MULT  = 3;      // overlay minimised
 
 function schedulePoll(delay) {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
   if (!accessToken) return;
   if (delay == null) {
     const playing = lastKnown?.playing;
-    if (dealerSubscribed) delay = playing ? 15000 : 30000;
-    else                  delay = playing ? 3000 : 6000;
+    delay = !lastKnown ? POLL_IDLE_MS : playing ? POLL_PLAYING_MS : POLL_PAUSED_MS;
+    if (overlayWindow && overlayWindow.isMinimized()) delay *= POLL_HIDDEN_MULT;
+    // Wake up right as the song should end so the next one shows promptly
     const remaining = estimatedRemainingMs();
-    if (playing && remaining != null && remaining > -2000) delay = Math.min(delay, Math.max(remaining + 400, 300));
+    if (playing && remaining != null && remaining > -2000) delay = Math.min(delay, Math.max(remaining + 600, 500));
   }
+  delay = Math.max(delay, bgBudgetWaitMs());
   const rl = rateLimitedUntil - Date.now();
-  if (rl > 0) delay = Math.max(delay, rl + 100);
+  if (rl > 0) delay = Math.max(delay, rl + 1000);
+  else if (rateLimitedUntil) { rateLimitedUntil = 0; saveJSON(RATE_FILE, { until: 0 }); sendRateLimitStatus(); }
   pollTimer = setTimeout(fetchAndSendCurrentState, Math.max(250, delay));
 }
 
@@ -632,16 +564,16 @@ async function doFetchState() {
   if (!overlayWindow) return;
   try {
     const t0  = Date.now();
-    const res = await spotifyRequest('/me/player');
+    const res = await spotifyRequest('/me/player', 'GET', null, false, true);
     const rtt = Date.now() - t0;
-    if (!res.ok) return; // transient error — keep showing what we have
+    if (!res.ok) return; 
     const data = res.data;
     if (!data || !data.item) {
       lastKnown = null;
       overlayWindow.webContents.send('no-device');
       return;
     }
-    // Compensates for half the request round-trip so lyrics aren't late
+    // Compensate for half the request round-trip so lyrics aren't late
     const progress = data.is_playing ? Math.min(data.progress_ms + Math.round(rtt / 2), data.item.duration_ms) : data.progress_ms;
     lastKnown = { id: data.item.id, duration: data.item.duration_ms, progress, at: Date.now(), playing: data.is_playing };
 
@@ -680,7 +612,7 @@ function registerShortcuts() {
     if (!key) return;
     try {
       const ok = globalShortcut.register(key, fn);
-      if (ok) console.log(`Shortcut registered: ${key} → ${label}`);
+      if (ok) console.log(`Shortcut registered: ${key} -> ${label}`);
       else    console.warn(`Could not register: ${key}`);
     } catch (e) { console.error(`Shortcut error (${key}):`, e.message); }
   };
@@ -731,6 +663,7 @@ function createOverlayWindow() {
   overlayWindow.on('moved',   saveWinState);
   overlayWindow.on('resized', saveWinState);
   overlayWindow.on('closed',  () => { overlayWindow = null; });
+  overlayWindow.on('restore', () => { if (accessToken) schedulePoll(300); });
 }
 
 function applyWindowMode(mode) {
@@ -770,18 +703,9 @@ function startAuthServer() {
         if (authWindow) { authWindow.close(); authWindow = null; }
         authServer.close(); authServer = null;
 
-        const playbackData = await getPlaybackState();
-        if (overlayWindow) {
-          overlayWindow.webContents.send('auth-success', {
-            shuffle:  playbackData?.shuffle_state ?? false,
-            repeat:   playbackData?.repeat_state  ?? 'off',
-            volume:   playbackData?.device?.volume_percent ?? 100,
-            device:   playbackData?.device?.name || null,
-            settings,
-          });
-        }
-        // Start WS + adaptive polling
-        connectDealer();
+        // The first poll (right below) fills in track, shuffle, repeat and volume
+        if (overlayWindow) overlayWindow.webContents.send('auth-success', { settings });
+        sendRateLimitStatus();
         startFallbackPoll();
       }
     });
@@ -810,7 +734,7 @@ ipcMain.on('login', async () => {
 
 ipcMain.on('get-settings', (e) => { e.returnValue = settings; });
 
-// Romanization of non-Latin lyrics (Japanese, Korean, Chinese, Cyrillic, …)
+// -
 ipcMain.handle('transliterate', async (_, lines) => {
   if (!Array.isArray(lines)) return { lang: null, lines: [] };
   try { return await transliterateLines(lines.slice(0, 2000)); }
@@ -821,14 +745,14 @@ ipcMain.on('save-settings', (_, s) => {
   const prevCTKey = settings.clickThroughKey;
   settings = { ...settings, ...s };
   saveJSON(SETTINGS_FILE, settings);
-  // Re-register shortcuts if any key changed
+// -
   if (s.clickThroughKey !== undefined || s.playPauseKey !== undefined || s.nextKey !== undefined || s.prevKey !== undefined) {
     registerShortcuts();
   }
   if (s.alwaysOnTop !== undefined && overlayWindow) {
     overlayWindow.setAlwaysOnTop(!!s.alwaysOnTop, 'screen-saver');
   }
-  // Apply window mode if changed
+// -
   if (s.miniMode !== undefined || s.fullscreenMode !== undefined) {
     const mode = settings.fullscreenMode ? 'fullscreen' : settings.miniMode ? 'mini' : 'normal';
     applyWindowMode(mode);
@@ -856,10 +780,7 @@ ipcMain.on('set-repeat',  async (_, state) => { await setRepeat(state); });
 ipcMain.on('set-opacity',      (_, v) => { if (overlayWindow) overlayWindow.setOpacity(v); });
 ipcMain.on('set-ignore-mouse', (_, b) => { if (overlayWindow) overlayWindow.setIgnoreMouseEvents(b, { forward: true }); });
 ipcMain.on('close-overlay',    ()     => app.quit());
-
-// Manual window dragging (used while the title bar auto-hides, where a native
-// drag region would swallow the hover that reveals it). Uses the real cursor
-// position so it stays accurate across monitors / DPI scaling.
+// -
 let dragState = null;
 ipcMain.on('drag-window', (_, phase) => {
   if (!overlayWindow) return;
@@ -876,7 +797,7 @@ ipcMain.on('drag-window', (_, phase) => {
       width: dragState.w, height: dragState.h,
     });
   } else if (phase === 'end') {
-    if (dragState) overlayWindow.emit('moved'); // persist the new position
+    if (dragState) overlayWindow.emit('moved');
     dragState = null;
   }
 });
@@ -916,17 +837,25 @@ ipcMain.on('reset-settings', () => {
 });
 
 // --- App lifecycle -------------------------------------------------------------
-app.whenReady().then(() => {
-  createOverlayWindow();
-  registerShortcuts();
-});
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!overlayWindow) return;
+    if (overlayWindow.isMinimized()) overlayWindow.restore();
+    overlayWindow.show();
+    overlayWindow.focus();
+  });
+  app.whenReady().then(() => {
+    createOverlayWindow();
+    registerShortcuts();
+    overlayWindow.webContents.on('did-finish-load', sendRateLimitStatus);
+  });
+}
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
-  if (dealer)               { try { dealer.close(); } catch {} }
-  if (dealerPingTimer)      clearInterval(dealerPingTimer);
-  if (dealerReconnectTimer) clearTimeout(dealerReconnectTimer);
-  if (dealerFetchTimeout)   clearTimeout(dealerFetchTimeout);
   if (pollTimer)            clearTimeout(pollTimer);
 });
 
